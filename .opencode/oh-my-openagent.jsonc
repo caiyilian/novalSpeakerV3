@@ -1,0 +1,15 @@
+{
+  "ulw_loop": {
+    "enabled": true,
+    "max_iterations": 5000,
+    "check_interval_seconds": 5
+  },
+  "todo_enforcer": { "enabled": true },
+  "telemetry": { "enabled": false },
+  "agents": {
+    "sisyphus": { "model": "ollama/qwen3:4b", "temperature": 0.1 },
+    "oracle": { "model": "ollama/qwen3:4b", "temperature": 0.1 },
+    "explore": { "model": "ollama/qwen3:4b", "temperature": 0.1 },
+    "librarian": { "model": "ollama/qwen3:4b", "temperature": 0.1 }
+  }
+}
