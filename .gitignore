@@ -9,7 +9,9 @@ opencode-novel-loop/
 # 服务器配置（含内网 IP 和密码，不公开）
 # =============================================
 ip_config
+servers.json
 check_gpu.py
+test_ollama.py
 
 # =============================================
 # OpenCode 本地隔离配置目录（运行时生成）
