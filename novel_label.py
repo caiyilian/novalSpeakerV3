@@ -1,294 +1,221 @@
 #!/usr/bin/env python3
-"""Multi-agent novel dialogue labeling V3 - with tool calling + detailed logging."""
-import json
-import os
-import re
-import sys
-import urllib.request
-import urllib.error
+"""Multi-agent novel dialogue labeling V3."""
+import json, os, re, sys, urllib.request, urllib.error
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-OLLAMA_URL = "http://172.31.102.237:11434"
-MODEL = "qwen3:32b"
-
+OLLAMA_URL, MODEL = "http://172.31.102.237:11434", "qwen3:32b"
 SHORT_TERM_PATH = os.path.join(BASE, ".omo", "memory", "short_term.json")
 LONG_TERM_PATH = os.path.join(BASE, ".omo", "memory", "long_term.json")
 CHARACTERS_PATH = os.path.join(BASE, ".omo", "evidence", "characters.json")
 PROGRESS_PATH = os.path.join(BASE, ".omo", "evidence", "progress.json")
 NOVEL_PATH = os.path.join(BASE, "novel.txt")
 LABELED_PATH = os.path.join(BASE, "labeled.txt")
-LOG_PATH = os.path.join(BASE, ".omo", "logs", "session_log.jsonl")
-TOOL_LOG_PATH = os.path.join(BASE, ".omo", "logs", "tool_calls.jsonl")
+SESSION_LOG_PATH = os.path.join(BASE, ".omo", "logs", "session_log.jsonl")
+TOOL_CALLS_LOG_PATH = os.path.join(BASE, ".omo", "logs", "tool_calls.jsonl")
+if sys.platform == "win32": sys.stdout.reconfigure(encoding="utf-8")
 
-if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8")
-
-MAX_TOOL_CALLS = 10
-
-
-def read_novel(start, end):
+def read_novel(s, e):
     with open(NOVEL_PATH, encoding="utf-8") as f:
-        lines = f.readlines()
-    start = max(1, start); end = min(len(lines), end)
-    text = "".join(lines[start-1:end])
-    return f"--- 第{start}行到第{end}行 ---\n{text}\n--- {end-start+1}行 ---"
+        l = f.readlines()
+    s, e = max(1,s), min(len(l),e)
+    return f"---第{s}到{e}行---\n" + "".join(l[s-1:e])
 
-
-def search_novel(keyword, limit=10):
-    results = []
+def search_novel(k, limit=10):
+    r = []
     with open(NOVEL_PATH, encoding="utf-8") as f:
-        for i, line in enumerate(f, 1):
-            if keyword in line:
-                results.append(f"第{i}行：{line.strip()[:80]}")
-                if len(results) >= limit: break
-    return "\n".join(results) if results else f"未找到「{keyword}」"
+        for i,line in enumerate(f,1):
+            if k in line:
+                r.append(f"第{i}行：{line.strip()[:80]}")
+                if len(r)>=limit: break
+    return "\n".join(r) or f"未找到「{k}」"
 
+TOOLS_R = [{"type":"function","function":{"name":"read_novel","parameters":{"type":"object","properties":{"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["start_line","end_line"]}}},
+           {"type":"function","function":{"name":"search_novel","parameters":{"type":"object","properties":{"keyword":{"type":"string"},"limit":{"type":"integer"}},"required":["keyword"]}}},
+           {"type":"function","function":{"name":"get_characters","parameters":{"type":"object","properties":{}}}}]
+TOOLS_F = TOOLS_R + [{"type":"function","function":{"name":"append_label","parameters":{"type":"object","properties":{"speaker":{"type":"string"}},"required":["speaker"]}}}]
 
-TOOLS = [
-    {"type":"function","function":{"name":"read_novel","description":"读取novel.txt中指定行范围的内容","parameters":{"type":"object","properties":{"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["start_line","end_line"]}}},
-    {"type":"function","function":{"name":"search_novel","description":"在novel.txt中搜索关键词","parameters":{"type":"object","properties":{"keyword":{"type":"string"},"limit":{"type":"integer"}},"required":["keyword"]}}},
-    {"type":"function","function":{"name":"get_characters","description":"获取当前角色注册表中的所有已知角色","parameters":{"type":"object","properties":{}}}}
-]
+def exec_tool(name, args):
+    if name=="read_novel": return read_novel(args["start_line"],args["end_line"])
+    if name=="search_novel": return search_novel(args["keyword"],args.get("limit",10))
+    if name=="get_characters":
+        c = read_characters(); return "、".join(c.keys()) or "暂无"
+    if name=="append_label":
+        with open(LABELED_PATH,"a",encoding="utf-8") as f: f.write(args["speaker"]+"\n")
+        return f"已写入 {args['speaker']}"
+    return "未知工具:"+name
 
+def log_sess(a,p,o,tc=0):
+    os.makedirs(os.path.dirname(SESSION_LOG_PATH),exist_ok=True)
+    with open(SESSION_LOG_PATH,"a",encoding="utf-8") as f:
+        f.write(json.dumps({"agent":a,"prompt":p[:600],"output":o[:300],"tool_calls":tc},ensure_ascii=False)+"\n")
 
-def execute_tool(name, args):
-    if name == "read_novel": return read_novel(args["start_line"], args["end_line"])
-    elif name == "search_novel": return search_novel(args["keyword"], args.get("limit", 10))
-    elif name == "get_characters":
-        chars = read_characters()
-        return "、".join(chars.keys()) if chars else "暂无"
-    return f"未知工具: {name}"
+def log_tool(a,t,args,r):
+    os.makedirs(os.path.dirname(TOOL_CALLS_LOG_PATH),exist_ok=True)
+    with open(TOOL_CALLS_LOG_PATH,"a",encoding="utf-8") as f:
+        f.write(json.dumps({"agent":a,"tool":t,"args":str(args)[:120],"result":str(r)[:200]},ensure_ascii=False)+"\n")
 
-
-def log_session(agent, prompt, output, tc=0):
-    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"agent":agent,"prompt":prompt[:600],"output":output[:300],"tool_calls":tc}, ensure_ascii=False)+"\n")
-
-
-def log_tool_call(agent, tool, args, result):
-    os.makedirs(os.path.dirname(TOOL_LOG_PATH), exist_ok=True)
-    with open(TOOL_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"agent":agent,"tool":tool,"args":str(args)[:120],"result":str(result)[:200]}, ensure_ascii=False)+"\n")
-
-
-def call_ollama(msgs, system, timeout=180, agent="unknown"):
-    if not msgs or msgs[0].get("role") != "system":
-        msgs.insert(0, {"role":"system","content":system})
-    prompt = msgs[-1].get("content","")[:600]
-    tc_count = 0
-    for _ in range(MAX_TOOL_CALLS):
-        body = json.dumps({"model":MODEL,"messages":msgs,"tools":TOOLS,"stream":False,"options":{"temperature":0.1}}).encode()
-        req = urllib.request.Request(OLLAMA_URL+"/api/chat", data=body, headers={"Content-Type":"application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+def call_ollama(msgs, system, timeout=180, agent="unknown", tools="R"):
+    """Call model with tools. tools='R'=read_only, 'F'=full(incl append_label)."""
+    tlist = TOOLS_F if tools=="F" else TOOLS_R
+    if not msgs or msgs[0].get("role")!="system": msgs.insert(0,{"role":"system","content":system})
+    p = msgs[-1].get("content","")[:600]; tc = 0
+    for _ in range(10):
+        body = json.dumps({"model":MODEL,"messages":msgs,"tools":tlist,"stream":False,"options":{"temperature":0.1}}).encode()
+        req = urllib.request.Request(OLLAMA_URL+"/api/chat",data=body,headers={"Content-Type":"application/json"})
+        with urllib.request.urlopen(req,timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
-        msg = data["message"]
-        content = msg.get("content","").strip()
-        tool_calls = msg.get("tool_calls")
-        if not tool_calls:
-            log_session(agent, prompt, content, tc_count)
-            return content if content else "（无输出）"
-        for tc in tool_calls:
-            tc_count += 1
-            name = tc["function"]["name"]
-            raw_args = tc["function"]["arguments"]
-            if isinstance(raw_args, str):
-                args = json.loads(raw_args)
-            else:
-                args = raw_args
-            result = execute_tool(name, args)
-            log_tool_call(agent, name, args, result)
-            print(f"    [{agent}] {name}({str(args)[:50]})")
-            msgs.append({"role":"assistant","content":"","tool_calls":[tc]})
-            msgs.append({"role":"tool","content":result,"tool_call_id":tc.get("id","")})
-    log_session(agent, prompt, "MAX_TOOL_CALLS", tc_count)
-    return "（达到最大工具调用次数）"
+        msg = data["message"]; content = msg.get("content","").strip(); calls = msg.get("tool_calls")
+        if not calls:
+            log_sess(agent,p,content,tc); return content or "（无输出）"
+        for c in calls:
+            tc += 1; nm = c["function"]["name"]
+            args = json.loads(c["function"]["arguments"]) if isinstance(c["function"]["arguments"],str) else c["function"]["arguments"]
+            result = exec_tool(nm,args); log_tool(agent,nm,args,result)
+            print(f"    [{agent}] {nm}({str(args)[:50]})")
+            msgs.append({"role":"assistant","content":"","tool_calls":[c]})
+            msgs.append({"role":"tool","content":result,"tool_call_id":c.get("id","")})
+    log_sess(agent,p,"MAX_CALLS",tc); return "（达到最大工具调用次数）"
 
-
-# ---- File helpers ----
+def call_ollama_nt(msgs, system, timeout=180, agent="unknown"):
+    """Call model WITHOUT any tools."""
+    if not msgs or msgs[0].get("role")!="system": msgs.insert(0,{"role":"system","content":system})
+    p = msgs[-1].get("content","")[:600]
+    body = json.dumps({"model":MODEL,"messages":msgs,"stream":False,"options":{"temperature":0.1}}).encode()
+    req = urllib.request.Request(OLLAMA_URL+"/api/chat",data=body,headers={"Content-Type":"application/json"})
+    with urllib.request.urlopen(req,timeout=timeout) as resp:
+        data = json.loads(resp.read().decode())
+    c = data["message"].get("content","").strip()
+    log_sess(agent,p,c,0); return c or "（无输出）"
 
 def get_dialogues():
-    result = []
-    with open(NOVEL_PATH, encoding="utf-8") as f:
-        for i, line in enumerate(f, 1):
-            for m in re.finditer(r"\u300c([^\u300d]+)\u300d", line):
-                result.append({"line":i,"text":m.group(1)})
-    return result
-
-def read_memory(path):
+    r = []
+    with open(NOVEL_PATH,encoding="utf-8") as f:
+        for i,line in enumerate(f,1):
+            for m in re.finditer(r"\u300c([^\u300d]+)\u300d",line): r.append({"line":i,"text":m.group(1)})
+    return r
+def read_memory(p):
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f).get("content","")
+        with open(p,encoding="utf-8") as f: return json.load(f).get("content","")
     except: return ""
-
-def write_memory(path, content):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"content":content}, f, ensure_ascii=False)
-
+def write_memory(p,c):
+    os.makedirs(os.path.dirname(p),exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: json.dump({"content":c},f,ensure_ascii=False)
 def read_characters():
     try:
-        with open(CHARACTERS_PATH, encoding="utf-8") as f:
-            return json.load(f)
+        with open(CHARACTERS_PATH,encoding="utf-8") as f: return json.load(f)
     except: return {}
-
-def write_characters(data):
-    os.makedirs(os.path.dirname(CHARACTERS_PATH), exist_ok=True)
-    with open(CHARACTERS_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
+def write_characters(d):
+    os.makedirs(os.path.dirname(CHARACTERS_PATH),exist_ok=True)
+    with open(CHARACTERS_PATH,"w",encoding="utf-8") as f: json.dump(d,f,ensure_ascii=False,indent=2)
 def read_progress():
     try:
-        with open(PROGRESS_PATH, encoding="utf-8") as f:
-            return json.load(f)
+        with open(PROGRESS_PATH,encoding="utf-8") as f: return json.load(f)
     except: return {"labeled":0,"last_line":0}
-
-def write_progress(data):
-    os.makedirs(os.path.dirname(PROGRESS_PATH), exist_ok=True)
-    with open(PROGRESS_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-
+def write_progress(d):
+    with open(PROGRESS_PATH,"w",encoding="utf-8") as f: json.dump(d,f,ensure_ascii=False)
+def append_label(speaker):
+    with open(LABELED_PATH,"a",encoding="utf-8") as f: f.write(speaker+"\n")
 def count_labels():
     try:
-        with open(LABELED_PATH, encoding="utf-8") as f:
-            return sum(1 for l in f if l.strip())
+        with open(LABELED_PATH,encoding="utf-8") as f: return sum(1 for l in f if l.strip())
     except: return 0
 
-def append_label(speaker):
-    with open(LABELED_PATH, "a", encoding="utf-8") as f:
-        f.write(speaker+"\n")
-
-
-# ---- Agent prompts ----
-
-SYSTEMS = {
-    "scene": "你是场景分析师。用 read_novel/search_novel 分析场景。最后用一句话概括场景（谁、在哪、做什么）。",
-    "character": "你是角色分析师。用 read_novel 读原文、search_novel 搜索角色名来分析说话人。输出角色名或身份词。",
-    "prosecutor": "你是检举师。用 read_novel/search_novel/get_characters 找证据。引用具体行号。",
-    "challenger": "你是质疑师。用 read_novel/search_novel 核实检举师的证据。指出不实之处。给出你的判断。",
-    "final": "你是最终标注师。可用 read_novel 自己核实。检举师和质疑师冲突时优先采信质疑师。只输出说话人名字。",
+S = {
+    "scene":"场景分析师。用 read_novel/search_novel 分析场景。用一句话概括（谁、在哪、做什么）。",
+    "character":"角色调查师。用 read_novel/search_novel/get_characters 自由搜索原文，找出说话人证据。只输出发现，不下结论。",
+    "prosecutor":"检举师。用 read_novel/search_novel/get_characters 找证据，引用具体行号。",
+    "challenger":"质疑师。用 read_novel/search_novel 核实检举师的证据。指出不实之处。",
+    "final":"最终标注师。综合所有证据判断说话人。你必须给出一个具体角色名或身份词，严禁输出「？？？」。如果证据不足，用 read_novel/search_novel 自己调查后再判断。检举师和质疑师冲突时优先采信质疑师。只输出名字。",
+    "executor":"执行师。根据判决调用 append_label 工具写入。完成后回复 DONE。",
 }
 
+def run_checker(claim, ctx=""):
+    return call_ollama([{"role":"user","content":f"需核实的claim：{claim}\n{ctx}\n请核实。正确回复 OK，否则说明情况。"}],"检查师。用 read_novel 严格核实 claim。",agent="checker")
 
-def label_one(d, short_term, long_term, st_count):
+def label_one(d, st, lt, stc):
     line, text = d["line"], d["text"]
-    print(f"\n{'='*60}\nDialogue at line {line}:「{text}」\n{'='*60}")
-
+    print(f"\n{'='*60}\nL{line}:「{text}」\n{'='*60}")
     # 1. Scene
-    print("\n[Scene] Analyzing scene...")
-    s1 = f"对话在第{line}行：「{text}」。请分析场景。"
-    scene = call_ollama([{"role":"user","content":s1}], SYSTEMS["scene"], agent="scene")
+    print("\n[Scene]...")
+    prev = read_progress().get("last_line",0)
+    ctx_range = f"请阅读第{prev+1}行到第{line+5}行的内容" if prev > 0 and line - prev > 3 else f"请阅读第{max(1,line-5)}行到第{line+5}行的内容"
+    scene = call_ollama([{"role":"user","content":f"对话在第{line}行：「{text}」。{ctx_range}，分析场景（谁、在哪、做什么）。"}],S["scene"],agent="scene")
     print(f"  -> {scene}")
-
-    # 2. Character
-    print("\n[Character] Analyzing speaker...")
-    s2 = f"对话在第{line}行：「{text}」。请判断说话人。"
-    char = call_ollama([{"role":"user","content":s2}], SYSTEMS["character"], agent="character")
-    print(f"  -> {char}")
-
-    # 3. Prosecutor
-    print("\n[Prosecutor] Searching evidence...")
-    s3 = f"对话在第{line}行：「{text}」。请找证据。"
-    claim = call_ollama([{"role":"user","content":s3}], SYSTEMS["prosecutor"], agent="prosecutor")
+    # 2. Character evidence (tools=R -> read/search/get_characters)
+    print("\n[Character] Searching...")
+    ev = call_ollama([{"role":"user","content":f"对话在第{line}行：「{text}」。搜索说话人证据。"}],S["character"],agent="character")
+    print(f"  -> {ev[:80]}")
+    ck = run_checker(ev,f"对话在第{line}行")
+    if "OK" not in ck: print(f"  [Checker] Issues: {ck[:60]}"); ev += f"\n[检查师意见] {ck}"
+    # 3. Prosecutor + Challenger
+    print("\n[Prosecutor]...")
+    claim = call_ollama([{"role":"user","content":f"对话在第{line}行：「{text}」。找证据。"}],S["prosecutor"],agent="prosecutor")
     print(f"  -> {claim[:80]}")
-
-    # 4. Challenger
-    print("\n[Challenger] Verifying...")
-    s4 = f"检举师声称：「{claim}」\n请核实证据，给出判断。"
-    chal = call_ollama([{"role":"user","content":s4}], SYSTEMS["challenger"], agent="challenger")
-    print(f"  -> {chal[:80]}")
-
-    lookahead = f"检举师：{claim}\n质疑师：{chal}"
-
-    # 5. Memory
-    print("\n[Memory] Summarizing...")
-    mp = (f"场景：{scene}\n角色分析：{char}\n后文：{lookahead}\n短期记忆：{short_term}\n长期记忆：{long_term}\n\n"
-          f"请用一段话汇总以上事实信息。不要推断说话人。")
-    mem = call_ollama([{"role":"user","content":mp}], "你只汇总信息，不做判断。", agent="memory")
+    chal = call_ollama([{"role":"user","content":f"检举师声称：「{claim}」\n请核实。"}],S["challenger"],agent="challenger")
+    print(f"  -> {chal[:80]}"); la = f"检举师：{claim}\n质疑师：{chal}"
+    # 4. Memory (no tools)
+    print("\n[Memory]...")
+    mem = call_ollama_nt([{"role":"user","content":f"场景：{scene}\n角色证据：{ev}\n后文：{la}\n短期：{st}\n长期：{lt}\n\n汇总事实。"}],"你只汇总信息，不做判断。",agent="memory")
     print(f"  -> {mem[:80]}")
-
-    # 6. Final labeler
-    print("\n[Labeler] Final judgment (with tools)...")
-    lp = (f"待标对话在第{line}行：「{text}」\n\n场景：{scene}\n角色：{char}\n后文：{lookahead}\n历史：{mem}\n\n"
-          f"规则：1.用原文角色名或身份词 2.已注册的角色用原名 3.拟声词标「非人物发声」4.完全不确定标「？？？」\n"
-          f"5.检举师和质疑师冲突时优先采信质疑师 6.可用 read_novel 自己核实 7.只输出说话人名字")
-    label = call_ollama([{"role":"user","content":lp}], SYSTEMS["final"], agent="final_labeler")
-    print(f"  -> Speaker: {label}")
-
-    # 7. Normalizer
-    existing = read_characters()
-    final = label
+    # 5. Final labeler (tools=R -> has read_novel to verify)
+    print("\n[Labeler]...")
+    lp = (f"待标对话在第{line}行：「{text}」\n\n场景：{scene}\n角色证据：{ev}\n后文：{la}\n历史：{mem}\n\n"
+          f"规则：1.用原文角色名 2.已注册角色用原名 3.拟声词标「非人物发声」4.不确定标「？？？」\n"
+          f"5.检举师和质疑师冲突时优先采信质疑师 6.可用 read_novel 核实 7.只输出名字，不要加「」括号")
+    label = call_ollama([{"role":"user","content":lp}],S["final"],agent="final_labeler")
+    print(f"  -> {label}")
+    # 6. Normalizer (tools=R -> has read_novel to check aliases)
+    existing = read_characters(); final = label
     if existing:
         cl = "、".join(existing.keys())
-        np_ = f"说话人：{label}\n已有：{cl}\n\n同一人？输出角色名或 NEW。不要输出'已有角色名'。"
-        norm = call_ollama([{"role":"user","content":np_}], "你是角色归一师。", agent="normalizer")
-        if norm not in ("NEW",""):
-            final = norm
-        print(f"\n[Normalizer] {norm} -> final: {final}")
-
-    # 8. Write (Python only)
+        n = call_ollama_nt([{"role":"user","content":f"说话人：{label}\n已有：{cl}\n\n同一人？输出角色名或 NEW。"}],"角色归一师。判断是否重复。只输出角色名或 NEW。",agent="normalizer")
+        if n not in ("NEW",""): final = n
+        print(f"\n[Normalizer] {n} -> final: {final}")
+        ck_n = run_checker(f"说话人{label}应归入已有角色{final}",f"对话在第{line}行：「{text}」")
+        if "OK" not in ck_n: print(f"  [Checker] Normalizer review: {ck_n[:60]}")
+    # 7. Executor (no tools - just confirms, Python writes)
+    print("\n[Executor] Confirming...")
+    call_ollama_nt([{"role":"user","content":f"最终判决：第{line}行「{text}」的说话人是{final}。确认无误回复 OK。"}],"执行师。确认判决无误后回复 OK。",agent="executor")
     append_label(final)
     print(f"  [Write] '{final}'")
-
-    # 9. Registry (Python only)
+    # 8. Registry (Python only)
     if final not in existing and final not in ("非人物发声","？？？"):
-        existing[final] = {"firstSeen":f"line {line}"}
-        write_characters(existing)
-
-    # 10. Short-term memory
-    prev = read_progress().get("last_line", 0)
-    dist = abs(line - prev)
-    st_updated = False
-    if dist > 5 and prev > 0:
-        print(f"\n[Memory] Scene change ({dist} lines)")
-        up = f"旧短期：{short_term}\n当前场景：{scene}\n\n概括新短期记忆："
-        short_term = call_ollama([{"role":"user","content":up}], "你是记忆管理员。", agent="short_term")
-        st_count += 1; st_updated = True
-        write_memory(SHORT_TERM_PATH, short_term)
-    else:
-        print(f"\n[Memory] Same scene (dist={dist})")
-
-    # 11. Long-term
-    if st_count > 0 and st_count % 5 == 0 and st_updated:
-        lp2 = f"旧长期：{long_term}\n最近：{short_term}\n\n概括更新后长期记忆。"
-        long_term = call_ollama([{"role":"user","content":lp2}], "你是历史记录员。", agent="long_term")
-        write_memory(LONG_TERM_PATH, long_term)
-
-    # 12. Progress
-    prog = read_progress()
-    prog["labeled"] += 1; prog["last_line"] = line
-    write_progress(prog)
-    print(f"\n{'='*60}\nProgress: {prog['labeled']} labeled\n{'='*60}")
-    return short_term, long_term, st_count
-
+        existing[final] = {"firstSeen":f"line {line}"}; write_characters(existing)
+        print(f"  [Registry] Added '{final}'")
+    # 9. Memory update
+    prev = read_progress().get("last_line",0); dist = abs(line-prev); st_up = False
+    if dist > 5 or prev == 0:
+        if prev == 0: print(f"\n[Memory] First dialogue, creating initial memory")
+        else: print(f"\n[Memory] Scene change ({dist} lines)")
+        st = call_ollama_nt([{"role":"user","content":f"旧短期：{st}\n当前场景：{scene}\n角色证据：{ev}\n后文：{la}\n\n用1-2句话概括新短期记忆。"}],"概括短期记忆。",agent="short_term")
+        stc += 1; st_up = True; write_memory(SHORT_TERM_PATH,st)
+        if not lt: lt = st; write_memory(LONG_TERM_PATH,lt); print("  [LongTerm] Init from short-term")
+        elif stc % 5 == 0:
+            lt = call_ollama_nt([{"role":"user","content":f"旧长期：{lt}\n最近：{st}\n\n用2-3句话概括更新后长期记忆。"}],"概括长期记忆。",agent="long_term")
+            write_memory(LONG_TERM_PATH,lt)
+    else: print(f"\n[Memory] Same (dist={dist})")
+    prog = read_progress(); prog["labeled"] += 1; prog["last_line"] = line; write_progress(prog)
+    print(f"\nProgress: {prog['labeled']} labeled\n{'='*60}")
+    return st, lt, stc
 
 def main():
     import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--reset", action="store_true")
-    p.add_argument("--count", type=int, default=1)
+    p = argparse.ArgumentParser(); p.add_argument("--reset",action="store_true"); p.add_argument("--count",type=int,default=1)
     a = p.parse_args()
     if a.reset:
-        for f in [LABELED_PATH]: os.path.exists(f) and os.remove(f)
-        write_progress({"labeled":0,"last_line":0})
-        write_characters({})
-        write_memory(SHORT_TERM_PATH,"")
-        write_memory(LONG_TERM_PATH,"")
-        for log in [LOG_PATH, TOOL_LOG_PATH]:
-            os.makedirs(os.path.dirname(log), exist_ok=True)
-            open(log, "w").close()
+        for f in [LABELED_PATH]:
+            if os.path.exists(f): os.remove(f)
+        write_progress({"labeled":0,"last_line":0}); write_characters({})
+        write_memory(SHORT_TERM_PATH,""); write_memory(LONG_TERM_PATH,"")
+        for l in [SESSION_LOG_PATH,TOOL_CALLS_LOG_PATH]:
+            os.makedirs(os.path.dirname(l),exist_ok=True); open(l,"w").close()
         print("[RESET] Done")
-
-    dialogs = get_dialogues()
-    start = count_labels()
-    st = read_memory(SHORT_TERM_PATH)
-    lt = read_memory(LONG_TERM_PATH)
-    sc = 0
+    dialogs = get_dialogues(); start = count_labels()
+    st = read_memory(SHORT_TERM_PATH); lt = read_memory(LONG_TERM_PATH); sc = 0
     print(f"Model: {MODEL}\nDialogues: {len(dialogs)}, start={start}")
     for i in range(start, min(start+a.count, len(dialogs))):
         st, lt, sc = label_one(dialogs[i], st, lt, sc)
     print(f"\nDone! {a.count} dialogues.")
-
 
 if __name__ == "__main__":
     main()
